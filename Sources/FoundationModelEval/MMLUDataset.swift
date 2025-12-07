@@ -121,6 +121,54 @@ extension MMLUDataset {
     }
 }
 
+// MARK: - Prompt Building
+extension MMLUEntry {
+    /// Introduction text for MMLU prompts - includes category
+    static func promptIntro(for category: String, reasoning: Bool) -> String {
+        if reasoning {
+            return "The following are multiple choice questions (with answers) about \(category). Think step by step and then finish your answer with \"The answer is (X)\" where X is the correct letter choice."
+        } else {
+            return "The following are multiple choice questions (with answers) about \(category). Answer with \"The answer is (X)\" where X is the correct letter choice."
+        }
+    }
+
+    /// Lead-in text before model generates answer
+    static func promptLeadIn(reasoning: Bool) -> String {
+        if reasoning {
+            return "**Answer**: Let's think step by step."
+        } else {
+            return "**Answer**: The answer is ("
+        }
+    }
+
+    /// Format this entry as a few-shot example (uses chain-of-thought if reasoning enabled)
+    func formatAsExample(reasoning: Bool) -> String {
+        if reasoning {
+            let cot = cotContent.isEmpty ? "The answer is (\(answer))." : cotContent
+            return """
+                **Question**: \(question)
+                **Options**: \(formattedOptions)
+                **Answer**: \(cot)
+
+
+                """
+        } else {
+            return """
+                **Question**: \(question)
+                **Options**: \(formattedOptions)
+                **Answer**: The answer is (\(answer)).
+
+
+                """
+        }
+    }
+
+    /// Format this entry as the final question (without answer)
+    func formatAsQuestion() -> String {
+        return "**Question**: \(question)\n**Options**: \(formattedOptions)"
+    }
+}
+
 // MARK: - Filtering and Querying
 extension Array where Element == MMLUEntry {
     var validQuestions: [MMLUEntry] {
