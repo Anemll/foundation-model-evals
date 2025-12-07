@@ -146,7 +146,7 @@ struct Dataset {
             for path in possibleValidationPaths {
                 if FileManager.default.fileExists(atPath: path.path) {
                     print("Found validation file at: \(path.path)")
-                    validationSplit = try ARCDataset.loadFromFile(at: path)
+                    validationSplit = try ARCDataset.loadFromFile(at: path).validQuestions
                     break
                 }
             }
@@ -195,7 +195,7 @@ struct Dataset {
             for path in possibleTestPaths {
                 if FileManager.default.fileExists(atPath: path.path) {
                     print("Found test file at: \(path.path)")
-                    testSplit = try ARCDataset.loadFromFile(at: path)
+                    testSplit = try ARCDataset.loadFromFile(at: path).validQuestions
                     break
                 }
             }
@@ -264,8 +264,118 @@ extension Array where Element == Answer {
     }
 }
 
+// MARK: - Batch Processing Support
+
+/// Result of evaluating a single question (for batch processing)
+struct QuestionResult: Sendable {
+    let questionIndex: Int
+    let answer: Answer
+    let predictedAnswer: String
+    let extractedChoice: String
+    let isCorrect: Bool
+    let wasRandom: Bool
+}
+
+/// Thread-safe actor for collecting results from parallel evaluations
+actor ResultCollector {
+    private var results: [QuestionResult] = []
+    private var completedCount: Int = 0
+    private let totalCount: Int
+    private let startTime: Date
+
+    init(totalCount: Int) {
+        self.totalCount = totalCount
+        self.startTime = Date()
+    }
+
+    func addResult(_ result: QuestionResult) {
+        results.append(result)
+        completedCount += 1
+    }
+
+    func getProgress() -> (completed: Int, total: Int, elapsed: TimeInterval) {
+        return (completedCount, totalCount, Date().timeIntervalSince(startTime))
+    }
+
+    func getSortedResults() -> [QuestionResult] {
+        return results.sorted { $0.questionIndex < $1.questionIndex }
+    }
+
+    func getAnswers() -> [Answer] {
+        return getSortedResults().map { $0.answer }
+    }
+}
+
+/// Extracts the predicted answer letter from model response
+func extractAnswer(from predictedAnswer: String, entry: QuestionEntry) -> (choice: String, wasRandom: Bool) {
+    // Try multiple patterns to extract the answer (support A-J for MMLU's 10 options)
+    let answerRE1 = /answer is \(([A-Ja-j])\)/.ignoresCase()
+    let answerRE2 = /answer is:?\s*([A-Ja-j])[\.\s,]/.ignoresCase()
+    let answerRE3 = /(?:correct )?answer(?:\sis)?:?\s*([A-Ja-j])[\.\s,\)]/.ignoresCase()
+    let answerRE4 = /^([A-Ja-j])(?:[\.\)\s]|$)/.ignoresCase()
+    let answerRE5 = /^\(?([A-Ja-j])\)\.?/.ignoresCase()
+    let answerRE6 = /answer:\s*([A-Ja-j])/.ignoresCase()
+
+    if let result = try? answerRE1.firstMatch(in: predictedAnswer) {
+        return (String(result.1).uppercased(), false)
+    } else if let result = try? answerRE2.firstMatch(in: predictedAnswer) {
+        return (String(result.1).uppercased(), false)
+    } else if let result = try? answerRE3.firstMatch(in: predictedAnswer) {
+        return (String(result.1).uppercased(), false)
+    } else if let result = try? answerRE4.firstMatch(in: predictedAnswer.trimmingCharacters(in: .whitespacesAndNewlines)) {
+        return (String(result.1).uppercased(), false)
+    } else if let result = try? answerRE5.firstMatch(in: predictedAnswer.trimmingCharacters(in: .whitespacesAndNewlines)) {
+        return (String(result.1).uppercased(), false)
+    } else if let result = try? answerRE6.firstMatch(in: predictedAnswer) {
+        return (String(result.1).uppercased(), false)
+    } else {
+        // Random choice - model didn't provide answer in expected format
+        let randomIndex = (0..<entry.options.count).randomElement() ?? 0
+        let answer: String
+        if let mmluEntry = entry as? MMLUEntry {
+            answer = mmluEntry.answerLetter(for: randomIndex)
+        } else if let arcEntry = entry as? ARCEntry {
+            answer = arcEntry.answerLetter(for: randomIndex)
+        } else if let boolqEntry = entry as? BoolQEntry {
+            answer = boolqEntry.answerLetter(for: randomIndex)
+        } else {
+            answer = String(Character(UnicodeScalar(Int(asciiA) + randomIndex)!))
+        }
+        return (answer, true)
+    }
+}
+
 @main
 struct FoundationModelEval {
+    /// Static helper to extract answer from model response (for use in concurrent tasks)
+    static func extractAnswerFromResponse(_ predictedAnswer: String, optionsCount: Int) -> (choice: String, wasRandom: Bool) {
+        let answerRE1 = /answer is \(([A-Ja-j])\)/.ignoresCase()
+        let answerRE2 = /answer is:?\s*([A-Ja-j])[\.\s,]/.ignoresCase()
+        let answerRE3 = /(?:correct )?answer(?:\sis)?:?\s*([A-Ja-j])[\.\s,\)]/.ignoresCase()
+        let answerRE4 = /^([A-Ja-j])(?:[\.\)\s]|$)/.ignoresCase()
+        let answerRE5 = /^\(?([A-Ja-j])\)\.?/.ignoresCase()
+        let answerRE6 = /answer:\s*([A-Ja-j])/.ignoresCase()
+
+        if let result = try? answerRE1.firstMatch(in: predictedAnswer) {
+            return (String(result.1).uppercased(), false)
+        } else if let result = try? answerRE2.firstMatch(in: predictedAnswer) {
+            return (String(result.1).uppercased(), false)
+        } else if let result = try? answerRE3.firstMatch(in: predictedAnswer) {
+            return (String(result.1).uppercased(), false)
+        } else if let result = try? answerRE4.firstMatch(in: predictedAnswer.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            return (String(result.1).uppercased(), false)
+        } else if let result = try? answerRE5.firstMatch(in: predictedAnswer.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            return (String(result.1).uppercased(), false)
+        } else if let result = try? answerRE6.firstMatch(in: predictedAnswer) {
+            return (String(result.1).uppercased(), false)
+        } else {
+            // Random choice - model didn't provide answer in expected format
+            let randomIndex = (0..<optionsCount).randomElement() ?? 0
+            let answer = String(Character(UnicodeScalar(65 + randomIndex)!)) // 65 = 'A'
+            return (answer, true)
+        }
+    }
+
     static func main() async throws {
         // Parse command line arguments
         // Usage: FoundationModelEval [benchmarks...] [startQuestionNumber] [maxShots] [--reason|--think] [--max N]
@@ -343,6 +453,19 @@ struct FoundationModelEval {
             print("Will save per-sample detailed results")
         }
 
+        // Check for --batch X flag (parallel processing)
+        var batchSize = 1
+        if let batchIndex = CommandLine.arguments.firstIndex(of: "--batch"),
+           batchIndex + 1 < CommandLine.arguments.count,
+           let batchValue = Int(CommandLine.arguments[batchIndex + 1]) {
+            batchSize = max(1, min(batchValue, 10)) // Clamp between 1 and 10
+            if batchSize != batchValue {
+                print("Warning: batch size clamped to \(batchSize)")
+            } else {
+                print("Batch size: \(batchSize) concurrent sessions")
+            }
+        }
+
         // Store all results for final report
         var allResults: [(benchmark: String, accuracy: Float, correct: Int, total: Int, time: TimeInterval)] = []
 
@@ -370,9 +493,6 @@ struct FoundationModelEval {
                 print("MMLU dataset downloaded to: \(datasetURL.path)")
             }
 
-            // Use SystemLanguageModel with permissive guardrails to avoid getting stuck on guardrail violations
-            let model = SystemLanguageModel(guardrails: .permissiveContentTransformations)
-
             // Shorter prompt to reduce token usage
             let instructions = "You have expert knowledge about various topics, and your only task is to respond to a single question. Please, follow the examples faithfully and answer the question using the same format asked for. Think carefull about the options, explain your reasoning, and make sure your answer ends with a line that has the same format as the ones in the examples."
 
@@ -382,15 +502,24 @@ struct FoundationModelEval {
             let evalProgressBar = CLIProgressBar(prefix: "Eval")
 
             // Calculate effective total entries (accounting for startQuestion and maxSamples)
-            let availableEntries = dataset.testCount - startQuestion + 1
+            let availableEntries = max(0, dataset.testCount - startQuestion + 1)
             let effectiveTotal: Int
             if let max = maxSamples {
                 effectiveTotal = min(max, availableEntries)
             } else {
                 effectiveTotal = availableEntries
             }
+
+            // Early exit if no questions available
+            if effectiveTotal == 0 {
+                print("Warning: No questions available (startQuestion \(startQuestion) exceeds dataset size \(dataset.testCount))")
+                continue
+            }
             let progress = Progress(totalUnitCount: Int64(effectiveTotal))
             let startTime = Date()
+
+            // Collect entries to evaluate
+            var entriesToEvaluate: [(index: Int, entry: QuestionEntry)] = []
             var questionIndex = 0
             for i in 0..<dataset.testCount {
                 guard let entry = dataset.getTestEntry(at: i) else { continue }
@@ -402,172 +531,172 @@ struct FoundationModelEval {
                 }
 
                 // Stop if we've reached maxSamples
-                if let max = maxSamples, answers.count >= max {
+                if entriesToEvaluate.count >= effectiveTotal {
                     break
                 }
 
-                // ANSI color codes for question display
-                let cyan = "\u{001B}[36m"
-                let resetQ = "\u{001B}[0m"
+                entriesToEvaluate.append((index: entriesToEvaluate.count, entry: entry))
+            }
 
-                print("\n\(cyan)═══════════════════════════════════════════════════════════════\(resetQ)")
-                print("\(cyan)[Q\(answers.count + 1)/\(effectiveTotal) ID:\(entry.questionId) Category:\(entry.category)]\(resetQ)")
+            // ANSI color codes
+            let cyan = "\u{001B}[36m"
+            let blue = "\u{001B}[34m"
+            let green = "\u{001B}[32m"
+            let red = "\u{001B}[31m"
+            let reset = "\u{001B}[0m"
 
-                // Print the question (with passage for BoolQ)
-                if let boolqEntry = entry as? BoolQEntry {
-                    // Truncate passage if too long
-                    let maxPassageLen = 500
-                    let passage = boolqEntry.passage.count > maxPassageLen
-                        ? String(boolqEntry.passage.prefix(maxPassageLen)) + "..."
-                        : boolqEntry.passage
-                    print("\(cyan)Passage:\(resetQ) \(passage)")
-                    print("\(cyan)Question:\(resetQ) \(boolqEntry.question)")
-                } else {
-                    print("\(cyan)Question:\(resetQ) \(entry.question)")
+            // Process entries in batches
+            var entryIndex = 0
+            while entryIndex < entriesToEvaluate.count {
+                let batchEnd = min(entryIndex + batchSize, entriesToEvaluate.count)
+                let currentBatch = Array(entriesToEvaluate[entryIndex..<batchEnd])
+
+                if batchSize > 1 {
+                    print("\n\(cyan)━━━ Processing batch of \(currentBatch.count) questions [\(entryIndex + 1)-\(batchEnd)/\(effectiveTotal)] ━━━\(reset)")
                 }
-                print("\(cyan)Options:\(resetQ) \(entry.formattedOptions)")
-                print("\(cyan)═══════════════════════════════════════════════════════════════\(resetQ)")
 
-                // Create a new session for each evaluation to reset context (stateless behavior)
-                let session = LanguageModelSession(model: model, instructions: instructions)
-
-                // Try with decreasing number of examples if context window is exceeded
-                var predictedAnswer: String = ""
-                var numExamples = maxShots // Start with the configured max shots
-                var success = false
-                var attempt = 0
-
-                while !success && numExamples >= 0 {
-                    attempt += 1
-                    // Build prompt with current number of examples
-                    guard let prompt = dataset.buildPrompt(for: entry.category, numExamples: numExamples, reasoning: useReasoning) else {
-                        fatalError("No prompt for category \(entry.category)")
-                    }
-                    // Build final prompt - use dataset-specific formatting
-                    let finalPrompt: String
-                    if let boolqEntry = entry as? BoolQEntry {
-                        finalPrompt = "\(prompt)\n\(boolqEntry.formatAsQuestion())\n\n\(BoolQEntry.promptLeadIn(reasoning: useReasoning))"
-                    } else if let arcEntry = entry as? ARCEntry {
-                        finalPrompt = "\(prompt)\n\(arcEntry.formatAsQuestion())\n\(ARCEntry.promptLeadIn(reasoning: useReasoning))"
-                    } else if let mmluEntry = entry as? MMLUEntry {
-                        finalPrompt = "\(prompt)\n\(mmluEntry.formatAsQuestion())\n\(MMLUEntry.promptLeadIn(reasoning: useReasoning))"
-                    } else {
-                        let leadIn = useReasoning ? "**Answer**: Let's think step by step." : "**Answer**: The answer is ("
-                        finalPrompt = "\(prompt)\n\(formattedQuestion(from: entry))\n\(formattedOptions(from: entry))\n\(leadIn)"
-                    }
-
-                    if attempt > 1 {
-                        print("\n  Retry attempt \(attempt) with \(numExamples)-shot prompt...", terminator: "")
-                    }
-
-                    do {
-                        let options = GenerationOptions(sampling: .greedy)
-                        let response = try await session.respond(to: finalPrompt, options: options)
-                        predictedAnswer = response.content
-                        success = true
-                        if numExamples < maxShots {
-                            print("\n  Note: Used \(numExamples)-shot prompt due to context limits (started with \(maxShots)-shot)")
-                        }
-                    } catch {
-                        let errorString = String(describing: error)
-                        if (errorString.contains("exceededContextWindowSize") || errorString.contains("exceeds the maximum allowed context size")) && numExamples > 0 {
-                            print("\n  Context window exceeded, trying with fewer examples...")
-                            numExamples = max(0, numExamples - 2)
-                            if numExamples == 0 {
-                                print("  Warning: Context window exceeded even with 0 examples. Using minimal prompt.")
+                // Pre-build prompts for batch (to avoid capturing dataset in tasks)
+                var batchPrompts: [(idx: Int, entry: QuestionEntry, prompts: [Int: String], correctChoice: String)] = []
+                for (idx, entry) in currentBatch {
+                    var prompts: [Int: String] = [:]
+                    for numEx in stride(from: maxShots, through: 0, by: -2) {
+                        if let prompt = dataset.buildPrompt(for: entry.category, numExamples: numEx, reasoning: useReasoning) {
+                            let finalPrompt: String
+                            if let boolqEntry = entry as? BoolQEntry {
+                                finalPrompt = "\(prompt)\n\(boolqEntry.formatAsQuestion())\n\n\(BoolQEntry.promptLeadIn(reasoning: useReasoning))"
+                            } else if let arcEntry = entry as? ARCEntry {
+                                finalPrompt = "\(prompt)\n\(arcEntry.formatAsQuestion())\n\(ARCEntry.promptLeadIn(reasoning: useReasoning))"
+                            } else if let mmluEntry = entry as? MMLUEntry {
+                                finalPrompt = "\(prompt)\n\(mmluEntry.formatAsQuestion())\n\(MMLUEntry.promptLeadIn(reasoning: useReasoning))"
+                            } else {
+                                let leadIn = useReasoning ? "**Answer**: Let's think step by step." : "**Answer**: The answer is ("
+                                finalPrompt = "\(prompt)\n\(formattedQuestion(from: entry))\n\(formattedOptions(from: entry))\n\(leadIn)"
                             }
-                        } else {
-                            print("\n  Model exception: \(error)")
-                            success = true
+                            prompts[numEx] = finalPrompt
                         }
                     }
-                }
-
-                // ANSI color codes
-                let blue = "\u{001B}[34m"
-                let green = "\u{001B}[32m"
-                let red = "\u{001B}[31m"
-                let reset = "\u{001B}[0m"
-
-                print("Model Response:")
-                if !predictedAnswer.isEmpty {
-                    print("\(blue)\(predictedAnswer)\(reset)")
-                } else {
-                    print("  [No response generated]")
-                }
-
-                let answer: String
-                // Try multiple patterns to extract the answer (support A-J for MMLU's 10 options)
-                let answerRE1 = /answer is \(([A-Ja-j])\)/.ignoresCase()
-                let answerRE2 = /answer is:?\s*([A-Ja-j])[\.\s,]/.ignoresCase()
-                let answerRE3 = /(?:correct )?answer(?:\sis)?:?\s*([A-Ja-j])[\.\s,\)]/.ignoresCase()
-                let answerRE4 = /^([A-Ja-j])(?:[\.\)\s]|$)/.ignoresCase()
-                let answerRE5 = /^\(?([A-Ja-j])\)\.?/.ignoresCase()
-                let answerRE6 = /answer:\s*([A-Ja-j])/.ignoresCase()
-
-                if let result = try? answerRE1.firstMatch(in: predictedAnswer) {
-                    answer = String(result.1).uppercased()
-                    let isCorrect = answer == entry.answer
-                    let resultColor = isCorrect ? green : red
-                    print("\(resultColor)Model: \(answer), Correct: \(entry.answer)\(reset)")
-                } else if let result = try? answerRE2.firstMatch(in: predictedAnswer) {
-                    answer = String(result.1).uppercased()
-                    let isCorrect = answer == entry.answer
-                    let resultColor = isCorrect ? green : red
-                    print("\(resultColor)Model: \(answer), Correct: \(entry.answer)\(reset)")
-                } else if let result = try? answerRE3.firstMatch(in: predictedAnswer) {
-                    answer = String(result.1).uppercased()
-                    let isCorrect = answer == entry.answer
-                    let resultColor = isCorrect ? green : red
-                    print("\(resultColor)Model: \(answer), Correct: \(entry.answer)\(reset)")
-                } else if let result = try? answerRE4.firstMatch(in: predictedAnswer.trimmingCharacters(in: .whitespacesAndNewlines)) {
-                    answer = String(result.1).uppercased()
-                    let isCorrect = answer == entry.answer
-                    let resultColor = isCorrect ? green : red
-                    print("\(resultColor)Model: \(answer), Correct: \(entry.answer)\(reset)")
-                } else if let result = try? answerRE5.firstMatch(in: predictedAnswer.trimmingCharacters(in: .whitespacesAndNewlines)) {
-                    answer = String(result.1).uppercased()
-                    let isCorrect = answer == entry.answer
-                    let resultColor = isCorrect ? green : red
-                    print("\(resultColor)Model: \(answer), Correct: \(entry.answer)\(reset)")
-                } else if let result = try? answerRE6.firstMatch(in: predictedAnswer) {
-                    answer = String(result.1).uppercased()
-                    let isCorrect = answer == entry.answer
-                    let resultColor = isCorrect ? green : red
-                    print("\(resultColor)Model: \(answer), Correct: \(entry.answer)\(reset)")
-                } else {
-                    // Random choice - model didn't provide answer in expected format
-                    let randomIndex = (0..<entry.options.count).randomElement() ?? 0
-                    if let mmluEntry = entry as? MMLUEntry {
-                        answer = mmluEntry.answerLetter(for: randomIndex)
-                    } else if let arcEntry = entry as? ARCEntry {
-                        answer = arcEntry.answerLetter(for: randomIndex)
-                    } else if let boolqEntry = entry as? BoolQEntry {
-                        answer = boolqEntry.answerLetter(for: randomIndex)
+                    let correctChoice: String
+                    if let mmluEntry = entry as? MMLUEntry, let letter = mmluEntry.answerLetter {
+                        correctChoice = letter
+                    } else if let arcEntry = entry as? ARCEntry, let letter = arcEntry.answerLetter {
+                        correctChoice = letter
+                    } else if let boolqEntry = entry as? BoolQEntry, let letter = boolqEntry.answerLetter {
+                        correctChoice = letter
                     } else {
-                        answer = String(Character(UnicodeScalar(Int(asciiA) + randomIndex)!))
+                        correctChoice = entry.answer
                     }
-                    let isCorrect = answer == entry.answer
-                    let resultColor = isCorrect ? green : red
-                    print("\(resultColor)Random: \(answer), Correct: \(entry.answer) (model format not recognized)\(reset)")
+                    batchPrompts.append((idx: idx, entry: entry, prompts: prompts, correctChoice: correctChoice))
                 }
-                scores[entry.category] = scores[entry.category]?.updated(with: answer == entry.answer)
 
-                // Store all answers for debugging
-                let correctChoice: String
-                if let mmluEntry = entry as? MMLUEntry, let letter = mmluEntry.answerLetter {
-                    correctChoice = letter
-                } else if let arcEntry = entry as? ARCEntry, let letter = arcEntry.answerLetter {
-                    correctChoice = letter
-                } else if let boolqEntry = entry as? BoolQEntry, let letter = boolqEntry.answerLetter {
-                    correctChoice = letter
-                } else {
-                    correctChoice = entry.answer
+                // Process batch in parallel using TaskGroup
+                let batchResults = await withTaskGroup(of: QuestionResult?.self, returning: [QuestionResult].self) { group in
+                    for item in batchPrompts {
+                        let idx = item.idx
+                        let prompts = item.prompts
+                        let correctChoice = item.correctChoice
+                        let questionId = item.entry.questionId
+                        let category = item.entry.category
+                        let optionsCount = item.entry.options.count
+
+                        group.addTask { @Sendable in
+                            // Create a new model AND session for each evaluation (attempting true parallelism)
+                            let taskModel = SystemLanguageModel(guardrails: .permissiveContentTransformations)
+                            let session = LanguageModelSession(model: taskModel, instructions: instructions)
+
+                            // Try with decreasing number of examples if context window is exceeded
+                            var predictedAnswer: String = ""
+                            var success = false
+
+                            for numExamples in stride(from: maxShots, through: 0, by: -2) {
+                                if success { break }
+                                guard let finalPrompt = prompts[numExamples] else { continue }
+
+                                do {
+                                    let options = GenerationOptions(sampling: .greedy)
+                                    let response = try await session.respond(to: finalPrompt, options: options)
+                                    predictedAnswer = response.content
+                                    success = true
+                                } catch {
+                                    let errorString = String(describing: error)
+                                    if !(errorString.contains("exceededContextWindowSize") || errorString.contains("exceeds the maximum allowed context size")) {
+                                        success = true // Give up on non-context errors
+                                    }
+                                }
+                            }
+
+                            // Extract answer using regex patterns
+                            let (extractedChoice, wasRandom) = Self.extractAnswerFromResponse(predictedAnswer, optionsCount: optionsCount)
+
+                            let loggedAnswer = Answer(
+                                questionId: questionId,
+                                category: category,
+                                correctChoice: correctChoice,
+                                predictedChoice: extractedChoice,
+                                predictedAnswer: predictedAnswer
+                            )
+
+                            return QuestionResult(
+                                questionIndex: idx,
+                                answer: loggedAnswer,
+                                predictedAnswer: predictedAnswer,
+                                extractedChoice: extractedChoice,
+                                isCorrect: extractedChoice == correctChoice,
+                                wasRandom: wasRandom
+                            )
+                        }
+                    }
+
+                    var results: [QuestionResult] = []
+                    for await result in group {
+                        if let result = result {
+                            results.append(result)
+                        }
+                    }
+                    return results.sorted { $0.questionIndex < $1.questionIndex }
                 }
-                let loggedAnswer = Answer(questionId: entry.questionId, category: entry.category, correctChoice: correctChoice, predictedChoice: answer, predictedAnswer: predictedAnswer)
-                answers.append(loggedAnswer)
 
-                progress.completedUnitCount += 1
+                // Print results for each question in the batch (in order)
+                for result in batchResults {
+                    let entry = currentBatch.first { $0.index == result.questionIndex }!.entry
+                    let displayNum = entryIndex + result.questionIndex - currentBatch.first!.index + 1
+
+                    print("\n\(cyan)═══════════════════════════════════════════════════════════════\(reset)")
+                    print("\(cyan)[Q\(displayNum)/\(effectiveTotal) ID:\(entry.questionId) Category:\(entry.category)]\(reset)")
+
+                    // Print the question (with passage for BoolQ)
+                    if let boolqEntry = entry as? BoolQEntry {
+                        let maxPassageLen = 500
+                        let passage = boolqEntry.passage.count > maxPassageLen
+                            ? String(boolqEntry.passage.prefix(maxPassageLen)) + "..."
+                            : boolqEntry.passage
+                        print("\(cyan)Passage:\(reset) \(passage)")
+                        print("\(cyan)Question:\(reset) \(boolqEntry.question)")
+                    } else {
+                        print("\(cyan)Question:\(reset) \(entry.question)")
+                    }
+                    print("\(cyan)Options:\(reset) \(entry.formattedOptions)")
+                    print("\(cyan)═══════════════════════════════════════════════════════════════\(reset)")
+
+                    print("Model Response:")
+                    if !result.predictedAnswer.isEmpty {
+                        print("\(blue)\(result.predictedAnswer)\(reset)")
+                    } else {
+                        print("  [No response generated]")
+                    }
+
+                    let resultColor = result.isCorrect ? green : red
+                    if result.wasRandom {
+                        print("\(resultColor)Random: \(result.extractedChoice), Correct: \(result.answer.correctChoice) (model format not recognized)\(reset)")
+                    } else {
+                        print("\(resultColor)Model: \(result.extractedChoice), Correct: \(result.answer.correctChoice)\(reset)")
+                    }
+
+                    // Update scores and answers
+                    scores[entry.category] = scores[entry.category]?.updated(with: result.isCorrect)
+                    answers.append(result.answer)
+                }
+
+                progress.completedUnitCount = Int64(answers.count)
 
                 // Calculate questions per second and estimated time to completion
                 let elapsedTime = Date().timeIntervalSince(startTime)
@@ -590,7 +719,9 @@ struct FoundationModelEval {
                 let accuracyPercent = String(format: "%.2f", answers.macroAccuracy * 100)
                 let qpsString = String(format: "%.2f", questionsPerSecond)
                 evalProgressBar.update(progress, info: "[Acc: \(accuracyPercent)% | QPS: \(qpsString) | ETA: \(estimatedTimeString)]")
-            } // End of questions loop
+
+                entryIndex = batchEnd
+            } // End of batch loop
 
             // Print final summary for this benchmark
             let totalTime = Date().timeIntervalSince(startTime)

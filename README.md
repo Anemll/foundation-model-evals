@@ -62,14 +62,17 @@ swift run FoundationModelEval arc-easy 1 3 --reason
 ### Command Line Arguments
 
 ```
-FoundationModelEval [benchmarks...] [startQuestion] [maxShots] [--reason|--think] [--max N] [--save-samples]
+FoundationModelEval [benchmarks...] [startQuestion] [maxShots] [options]
 
 Arguments:
   benchmarks       - One or more: mmlu, arc-easy, arc-challenge, boolq (default: mmlu)
   startQuestion    - Question number to start from (default: 1)
   maxShots         - Number of few-shot examples (0-10, default: 5)
+
+Options:
   --reason/--think - Enable chain-of-thought prompting
   --max N          - Maximum number of samples per benchmark (default: all)
+  --batch N        - Process N questions in parallel (1-10, default: 1)
   --save-samples   - Save per-sample detailed results (default: summary only)
 ```
 
@@ -102,11 +105,15 @@ swift run FoundationModelEval mmlu arc-easy arc-challenge boolq 1 5 --max 100
 
 # Save per-sample detailed results (in addition to summary)
 swift run FoundationModelEval boolq 1 5 --max 100 --save-samples
+
+# Parallel processing: Run 4 questions concurrently
+swift run FoundationModelEval arc-easy 1 5 --max 100 --batch 4
 ```
 
 ## Features
 
 - **Auto-download** - All datasets download automatically from HuggingFace
+- **Batch processing** - Process multiple questions in parallel with `--batch N`
 - **Color-coded output** - Blue for model response, green/red for correct/incorrect
 - **Real-time progress** - Shows accuracy, questions per second, and ETA
 - **Context management** - Automatically reduces examples if context window exceeded
