@@ -160,15 +160,14 @@ COMBINED RESULTS REPORT
 ════════════════════════════════════════════════════════════
 Prompt mode:    direct answer (no reasoning)
 Few-shot:       5-shot
-Max samples:    100 per benchmark
 ------------------------------------------------------------
 Benchmark         Accuracy    Correct       Time
 ------------------------------------------------------------
-boolq              80.00%     80/100      2m30s
-arc-easy           75.00%     75/100      3m15s
-arc-challenge      60.00%     60/100      4m45s
+boolq              83.55%   2732/3270    38m26s
+arc-easy           92.09%   2188/2376    13m39s
+arc-challenge      82.76%    970/1172     8m02s
 ------------------------------------------------------------
-OVERALL            71.67%    215/300     10m30s
+OVERALL            86.47%   5890/6818    60m07s
 ════════════════════════════════════════════════════════════
 ```
 
@@ -181,6 +180,16 @@ Results are saved to the `results/` folder:
 | `*_summary.json` | Always | Benchmark settings, accuracy, timing |
 | `*_answers.json` | With `--save-samples` | Per-question predictions and correctness |
 | `combined_*_report.json` | Multiple benchmarks | Aggregated results across all benchmarks |
+
+## Benchmark Results
+
+Results on Apple Foundation Models (M5, macOS 26 Tahoe, 5-shot, direct answer mode):
+
+| Benchmark | Accuracy | Correct | Time |
+|-----------|----------|---------|------|
+| **BoolQ** | 83.55% | 2732/3270 | 38m26s |
+| **ARC-Easy** | 92.09% | 2188/2376 | 13m39s |
+| **ARC-Challenge** | 82.76% | 970/1172 | 8m02s |
 
 ## Dataset Caching
 
