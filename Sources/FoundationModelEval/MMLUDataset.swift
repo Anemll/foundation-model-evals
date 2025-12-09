@@ -128,7 +128,9 @@ extension MMLUEntry {
         if reasoning {
             return "The following are multiple choice questions (with answers) about \(category). Think step by step and then finish your answer with \"The answer is (X)\" where X is the correct letter choice."
         } else {
-            return "The following are multiple choice questions (with answers) about \(category). Answer with \"The answer is (X)\" where X is the correct letter choice."
+            return 
+             "You are answering multiple-choice exam questions. Answer each question in the format: \"The answer is (X)\" where X is the correct letter choice."
+            
         }
     }
 

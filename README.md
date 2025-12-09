@@ -70,10 +70,12 @@ Arguments:
   maxShots         - Number of few-shot examples (0-10, default: 5)
 
 Options:
-  --reason/--think - Enable chain-of-thought prompting
-  --max N          - Maximum number of samples per benchmark (default: all)
-  --batch N        - Process N questions in parallel (1-10, default: 1)
-  --save-samples   - Save per-sample detailed results (default: summary only)
+  --reason/--think   - Enable chain-of-thought prompting
+  --max N            - Maximum number of samples per benchmark (default: all)
+  --max-per-category N - Sample N questions from each category (balanced sampling)
+  --batch N          - Process N questions in parallel (1-10, default: 1)
+  --save-samples     - Save per-sample detailed results (default: summary only)
+  --adapter PATH     - Use a custom LoRA adapter (.fmadapter bundle)
 ```
 
 ### Examples
@@ -108,11 +110,19 @@ swift run FoundationModelEval boolq 1 5 --max 100 --save-samples
 
 # Parallel processing: Run 4 questions concurrently
 swift run FoundationModelEval arc-easy 1 5 --max 100 --batch 4
+
+# Evaluate with a custom LoRA adapter
+swift run FoundationModelEval mmlu 1 0 --max 50 --adapter /path/to/my_adapter.fmadapter
+
+# Balanced sampling: 10 questions from each MMLU category (14 categories = 140 total)
+swift run FoundationModelEval mmlu 1 5 --max-per-category 10
 ```
 
 ## Features
 
 - **Auto-download** - All datasets download automatically from HuggingFace
+- **Adapter support** - Evaluate custom LoRA adapters with `--adapter PATH`
+- **Balanced sampling** - Sample evenly across categories with `--max-per-category N`
 - **Batch processing** - Process multiple questions in parallel with `--batch N`
 - **Color-coded output** - Blue for model response, green/red for correct/incorrect
 - **Real-time progress** - Shows accuracy, questions per second, and ETA
@@ -190,6 +200,21 @@ Results on Apple Foundation Models (M5, macOS 26 Tahoe, 5-shot, direct answer mo
 | **BoolQ** | 83.55% | 2732/3270 | 38m26s |
 | **ARC-Easy** | 92.09% | 2188/2376 | 13m39s |
 | **ARC-Challenge** | 82.76% | 970/1172 | 8m02s |
+
+## Custom Adapter Evaluation
+
+Evaluate LoRA fine-tuned adapters against baseline:
+
+```bash
+# Evaluate adapter on MMLU (0-shot recommended for fine-tuned models)
+swift run FoundationModelEval mmlu 1 0 --max 100 --adapter ./my_adapter.fmadapter
+
+# Compare baseline vs adapter on same benchmark
+swift run FoundationModelEval arc-easy 1 5 --max 100                    # baseline
+swift run FoundationModelEval arc-easy 1 5 --max 100 --adapter ./adapter.fmadapter  # adapter
+```
+
+Adapters must be in `.fmadapter` bundle format. See [Apple's adapter training documentation](https://developer.apple.com/documentation/foundationmodels/loading-and-using-a-custom-adapter-with-foundation-models) for details.
 
 ## Dataset Caching
 

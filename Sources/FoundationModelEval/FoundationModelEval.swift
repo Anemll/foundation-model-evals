@@ -378,14 +378,16 @@ struct FoundationModelEval {
 
     static func main() async throws {
         // Parse command line arguments
-        // Usage: FoundationModelEval [benchmarks...] [startQuestionNumber] [maxShots] [--reason|--think] [--max N]
+        // Usage: FoundationModelEval [benchmarks...] [startQuestionNumber] [maxShots] [--reason|--think] [--max N] [--adapter PATH]
         // Example: FoundationModelEval mmlu 29 5  (MMLU benchmark, starts from question 29, uses 5-shot)
         // Example: FoundationModelEval arc-easy 1 3   (ARC-Easy, starts from question 1, uses 3-shot)
         // Example: FoundationModelEval boolq arc-easy 1 5 --max 100  (Multiple benchmarks)
         // Example: FoundationModelEval arc-easy 1 3 --reason  (ARC-Easy with chain-of-thought reasoning)
+        // Example: FoundationModelEval mmlu 1 0 --max 50 --adapter /path/to/mmlu_adapter.fmadapter  (With custom adapter)
         // Supported benchmarks: mmlu, arc-easy, arc-challenge, boolq
         // --reason or --think: Enable chain-of-thought prompting (default: direct answer mode)
         // --max N: Maximum number of samples to evaluate (default: all)
+        // --adapter PATH: Path to .fmadapter bundle to use for evaluation
         let validBenchmarks = ["mmlu", "arc-easy", "arc-challenge", "boolq"]
         var benchmarks: [String] = []
         let startQuestion: Int
@@ -447,10 +449,27 @@ struct FoundationModelEval {
             print("Maximum samples per benchmark: \(maxSamples!)")
         }
 
+        // Check for --max-per-category N flag (sample N questions from each category)
+        var maxPerCategory: Int? = nil
+        if let maxPerCatIndex = CommandLine.arguments.firstIndex(of: "--max-per-category"),
+           maxPerCatIndex + 1 < CommandLine.arguments.count,
+           let maxPerCatValue = Int(CommandLine.arguments[maxPerCatIndex + 1]) {
+            maxPerCategory = max(1, maxPerCatValue)
+            print("Maximum samples per category: \(maxPerCategory!)")
+        }
+
         // Check for --save-samples flag (save per-sample detailed results)
         let saveSamples = CommandLine.arguments.contains("--save-samples")
         if saveSamples {
             print("Will save per-sample detailed results")
+        }
+
+        // Check for --adapter PATH flag (load custom adapter)
+        var adapterPath: String? = nil
+        if let adapterIndex = CommandLine.arguments.firstIndex(of: "--adapter"),
+           adapterIndex + 1 < CommandLine.arguments.count {
+            adapterPath = CommandLine.arguments[adapterIndex + 1]
+            print("Using adapter: \(adapterPath!)")
         }
 
         // Check for --batch X flag (parallel processing)
@@ -494,7 +513,19 @@ struct FoundationModelEval {
             }
 
             // Shorter prompt to reduce token usage
-            let instructions = "You have expert knowledge about various topics, and your only task is to respond to a single question. Please, follow the examples faithfully and answer the question using the same format asked for. Think carefull about the options, explain your reasoning, and make sure your answer ends with a line that has the same format as the ones in the examples."
+            let instructions = "You have expert knowledge about various topics, and your only task is to respond to a single question. Please, follow the examples faithfully and answer the question using the same format asked for. Think carefully about the options, explain your reasoning, and make sure your answer ends with a line that has the same format as the ones in the examples."
+
+            // Load adapter if specified
+            var adapter: SystemLanguageModel.Adapter? = nil
+            if let path = adapterPath {
+                let adapterURL = URL(fileURLWithPath: path)
+                do {
+                    adapter = try SystemLanguageModel.Adapter(fileURL: adapterURL)
+                    print("✓ Adapter loaded successfully from: \(path)")
+                } catch {
+                    print("⚠️ Failed to load adapter: \(error). Continuing without adapter.")
+                }
+            }
 
             let dataset = try Dataset.load(from: datasetURL, benchmark: benchmark)
             var answers: [Answer] = []
@@ -502,41 +533,76 @@ struct FoundationModelEval {
             let evalProgressBar = CLIProgressBar(prefix: "Eval")
 
             // Calculate effective total entries (accounting for startQuestion and maxSamples)
+            // Note: For --max-per-category, we'll recalculate after collecting entries
             let availableEntries = max(0, dataset.testCount - startQuestion + 1)
-            let effectiveTotal: Int
-            if let max = maxSamples {
+            var effectiveTotal: Int
+            if let maxPerCat = maxPerCategory {
+                // Estimate: categories * maxPerCat (will be updated after collection)
+                effectiveTotal = dataset.categories.count * maxPerCat
+            } else if let max = maxSamples {
                 effectiveTotal = min(max, availableEntries)
             } else {
                 effectiveTotal = availableEntries
             }
 
-            // Early exit if no questions available
-            if effectiveTotal == 0 {
+            // Early exit if no questions available (only for non-per-category mode)
+            if effectiveTotal == 0 && maxPerCategory == nil {
                 print("Warning: No questions available (startQuestion \(startQuestion) exceeds dataset size \(dataset.testCount))")
                 continue
             }
-            let progress = Progress(totalUnitCount: Int64(effectiveTotal))
             let startTime = Date()
 
             // Collect entries to evaluate
             var entriesToEvaluate: [(index: Int, entry: QuestionEntry)] = []
-            var questionIndex = 0
-            for i in 0..<dataset.testCount {
-                guard let entry = dataset.getTestEntry(at: i) else { continue }
-                questionIndex += 1
 
-                // Skip questions before the start question
-                if questionIndex < startQuestion {
-                    continue
+            if let maxPerCat = maxPerCategory {
+                // Per-category sampling: collect all entries first, group by category, then sample
+                var entriesByCategory: [String: [QuestionEntry]] = [:]
+                for i in 0..<dataset.testCount {
+                    guard let entry = dataset.getTestEntry(at: i) else { continue }
+                    entriesByCategory[entry.category, default: []].append(entry)
                 }
 
-                // Stop if we've reached maxSamples
-                if entriesToEvaluate.count >= effectiveTotal {
-                    break
+                // Sample up to maxPerCat from each category
+                var sampledEntries: [QuestionEntry] = []
+                for category in dataset.categories.sorted() {
+                    if let categoryEntries = entriesByCategory[category] {
+                        let sampled = Array(categoryEntries.prefix(maxPerCat))
+                        sampledEntries.append(contentsOf: sampled)
+                    }
                 }
 
-                entriesToEvaluate.append((index: entriesToEvaluate.count, entry: entry))
+                // Convert to indexed entries
+                for (i, entry) in sampledEntries.enumerated() {
+                    entriesToEvaluate.append((index: i, entry: entry))
+                }
+
+                print("Sampled \(entriesToEvaluate.count) questions across \(entriesByCategory.count) categories (max \(maxPerCat) per category)")
+                // Update effectiveTotal to actual count
+                effectiveTotal = entriesToEvaluate.count
+            } else {
+                // Original sequential collection
+                var questionIndex = 0
+                for i in 0..<dataset.testCount {
+                    guard let entry = dataset.getTestEntry(at: i) else { continue }
+                    questionIndex += 1
+
+                    // Skip questions before the start question
+                    if questionIndex < startQuestion {
+                        continue
+                    }
+
+                    // Stop if we've reached maxSamples
+                    if entriesToEvaluate.count >= effectiveTotal {
+                        break
+                    }
+
+                    entriesToEvaluate.append((index: entriesToEvaluate.count, entry: entry))
+                }
             }
+
+            // Create progress tracker after we know the actual count
+            let progress = Progress(totalUnitCount: Int64(effectiveTotal))
 
             // ANSI color codes
             let cyan = "\u{001B}[36m"
@@ -589,6 +655,13 @@ struct FoundationModelEval {
                 }
 
                 // Process batch in parallel using TaskGroup
+                // Create model outside task group (SystemLanguageModel is Sendable, Adapter is not)
+                let taskModel: SystemLanguageModel
+                if let loadedAdapter = adapter {
+                    taskModel = SystemLanguageModel(adapter: loadedAdapter, guardrails: .default)
+                } else {
+                    taskModel = SystemLanguageModel(guardrails: .permissiveContentTransformations)
+                }
                 let batchResults = await withTaskGroup(of: QuestionResult?.self, returning: [QuestionResult].self) { group in
                     for item in batchPrompts {
                         let idx = item.idx
@@ -599,8 +672,7 @@ struct FoundationModelEval {
                         let optionsCount = item.entry.options.count
 
                         group.addTask { @Sendable in
-                            // Create a new model AND session for each evaluation (attempting true parallelism)
-                            let taskModel = SystemLanguageModel(guardrails: .permissiveContentTransformations)
+                            // Create session with the pre-configured model
                             let session = LanguageModelSession(model: taskModel, instructions: instructions)
 
                             // Try with decreasing number of examples if context window is exceeded
@@ -743,6 +815,9 @@ struct FoundationModelEval {
             print("Benchmark:      \(benchmark)")
             print("Prompt mode:    \(useReasoning ? "reasoning (chain-of-thought)" : "direct answer (no reasoning)")")
             print("Few-shot:       \(maxShots)-shot")
+            if let path = adapterPath {
+                print("Adapter:        \(path)")
+            }
             print("Questions:      \(answers.count) (started at #\(startQuestion))")
             print("Total time:     \(totalTimeString)")
             print(String(repeating: "-", count: 60))
@@ -788,7 +863,7 @@ struct FoundationModelEval {
 
                 // Save summary (always)
                 let correctCount = answers.filter { $0.isCorrect }.count
-                let summary: [String: Any] = [
+                var summary: [String: Any] = [
                     "benchmark": benchmark,
                     "prompt_mode": useReasoning ? "reasoning" : "direct",
                     "few_shot": maxShots,
@@ -799,6 +874,9 @@ struct FoundationModelEval {
                     "total_time_seconds": totalTime,
                     "timestamp": timestamp
                 ]
+                if let path = adapterPath {
+                    summary["adapter"] = path
+                }
                 let summaryData = try JSONSerialization.data(withJSONObject: summary, options: [.prettyPrinted, .sortedKeys])
                 let summaryURL = resultsDir.appendingPathComponent("\(filenameBase)_summary.json")
                 try summaryData.write(to: summaryURL)
@@ -818,6 +896,9 @@ struct FoundationModelEval {
             print(String(repeating: "═", count: 60))
             print("Prompt mode:    \(useReasoning ? "reasoning (chain-of-thought)" : "direct answer (no reasoning)")")
             print("Few-shot:       \(maxShots)-shot")
+            if let path = adapterPath {
+                print("Adapter:        \(path)")
+            }
             if let max = maxSamples {
                 print("Max samples:    \(max) per benchmark")
             }
@@ -877,7 +958,7 @@ struct FoundationModelEval {
             let benchmarkNames = allResults.map { $0.benchmark }.joined(separator: "_")
             let combinedFilename = "combined_\(benchmarkNames)_\(maxShots)shot_\(reasoningMode)_\(timestamp)_report.json"
 
-            let combinedReport: [String: Any] = [
+            var combinedReport: [String: Any] = [
                 "benchmarks": allResults.map { ["benchmark": $0.benchmark, "accuracy": $0.accuracy * 100, "correct": $0.correct, "total": $0.total, "time_seconds": $0.time] },
                 "overall_accuracy": overallAccuracy,
                 "total_correct": totalCorrect,
@@ -887,6 +968,9 @@ struct FoundationModelEval {
                 "few_shot": maxShots,
                 "timestamp": timestamp
             ]
+            if let path = adapterPath {
+                combinedReport["adapter"] = path
+            }
 
             if let combinedData = try? JSONSerialization.data(withJSONObject: combinedReport, options: [.prettyPrinted, .sortedKeys]) {
                 let combinedURL = resultsDir.appendingPathComponent(combinedFilename)
