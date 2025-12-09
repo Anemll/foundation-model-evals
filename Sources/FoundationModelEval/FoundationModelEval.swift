@@ -242,26 +242,123 @@ struct Answer: Codable {
     var correctChoice: String
     var predictedChoice: String
     var predictedAnswer: String
+    var classification: ResponseClassification
 
     var isCorrect: Bool { correctChoice == predictedChoice }
+    var isValidAnswer: Bool { classification == .validAnswer }
 }
 
 struct Score {
     var total: Int
     var correct: Int
+    var validAnswers: Int
+    var safetyRefusals: Int
+    var formatFailures: Int
 
-    func updated(with correctEntry: Bool) -> Score {
-        let updatedCorrect = correctEntry ? correct + 1 : correct
-        return Score(total: total+1, correct: updatedCorrect)
+    func updated(with answer: Answer) -> Score {
+        var newScore = self
+        newScore.total += 1
+        if answer.isValidAnswer && answer.isCorrect {
+            newScore.correct += 1
+        }
+        switch answer.classification {
+        case .validAnswer:
+            newScore.validAnswers += 1
+        case .safetyRefusal:
+            newScore.safetyRefusals += 1
+        case .formatFailure:
+            newScore.formatFailures += 1
+        }
+        return newScore
+    }
+
+    static var zero: Score {
+        Score(total: 0, correct: 0, validAnswers: 0, safetyRefusals: 0, formatFailures: 0)
     }
 }
 
 extension Array where Element == Answer {
+    /// Raw accuracy (correct / total) - includes random guesses for refusals
     var macroAccuracy: Float {
         guard !self.isEmpty else { return 0 }
         let correctAnswers = self.filter { $0.isCorrect }
         return Float(correctAnswers.count) / Float(self.count)
     }
+
+    /// True accuracy (correct / valid answers only) - excludes safety refusals and format failures
+    var trueAccuracy: Float {
+        let validAnswers = self.filter { $0.isValidAnswer }
+        guard !validAnswers.isEmpty else { return 0 }
+        let correctValid = validAnswers.filter { $0.isCorrect }
+        return Float(correctValid.count) / Float(validAnswers.count)
+    }
+
+    /// Format success rate (valid answers / total)
+    var formatSuccessRate: Float {
+        guard !self.isEmpty else { return 0 }
+        let validAnswers = self.filter { $0.isValidAnswer }
+        return Float(validAnswers.count) / Float(self.count)
+    }
+
+    /// Safety refusal rate (safety refusals / total)
+    var safetyRefusalRate: Float {
+        guard !self.isEmpty else { return 0 }
+        let refusals = self.filter { $0.classification == .safetyRefusal }
+        return Float(refusals.count) / Float(self.count)
+    }
+
+    var validCount: Int { self.filter { $0.isValidAnswer }.count }
+    var safetyRefusalCount: Int { self.filter { $0.classification == .safetyRefusal }.count }
+    var formatFailureCount: Int { self.filter { $0.classification == .formatFailure }.count }
+    var correctValidCount: Int { self.filter { $0.isValidAnswer && $0.isCorrect }.count }
+}
+
+// MARK: - Response Classification
+
+/// Classification of model response for scientific evaluation
+enum ResponseClassification: String, Codable, Sendable {
+    case validAnswer = "valid"        // Model gave a parseable answer
+    case safetyRefusal = "safety"     // Model refused due to content moderation
+    case formatFailure = "format"     // Output exists but couldn't parse answer
+}
+
+/// Detects if a response is a safety refusal
+func detectSafetyRefusal(_ response: String) -> Bool {
+    let trimmed = response.trimmingCharacters(in: .whitespacesAndNewlines)
+
+    // Empty response is a safety refusal
+    if trimmed.isEmpty {
+        return true
+    }
+
+    // Common AFM safety refusal phrases
+    let safetyPhrases = [
+        "I cannot assist",
+        "I'm unable to",
+        "I can't help",
+        "I cannot provide",
+        "I'm not able to",
+        "As an AI",
+        "I don't feel comfortable",
+        "I cannot engage",
+        "I won't be able to",
+        "I apologize, but I cannot",
+        "I'm sorry, but I can't",
+        "This request involves",
+        "I cannot answer",
+        "not appropriate for me to",
+        "I must decline",
+        "I cannot respond to"
+    ]
+
+    let lowercased = trimmed.lowercased()
+    for phrase in safetyPhrases {
+        if lowercased.contains(phrase.lowercased()) {
+            return true
+        }
+    }
+
+    return false
 }
 
 // MARK: - Batch Processing Support
@@ -274,6 +371,7 @@ struct QuestionResult: Sendable {
     let extractedChoice: String
     let isCorrect: Bool
     let wasRandom: Bool
+    let classification: ResponseClassification
 }
 
 /// Thread-safe actor for collecting results from parallel evaluations
@@ -348,7 +446,16 @@ func extractAnswer(from predictedAnswer: String, entry: QuestionEntry) -> (choic
 @main
 struct FoundationModelEval {
     /// Static helper to extract answer from model response (for use in concurrent tasks)
-    static func extractAnswerFromResponse(_ predictedAnswer: String, optionsCount: Int) -> (choice: String, wasRandom: Bool) {
+    /// Returns: (choice, wasRandom, classification)
+    static func extractAnswerFromResponse(_ predictedAnswer: String, optionsCount: Int) -> (choice: String, wasRandom: Bool, classification: ResponseClassification) {
+        // First check for safety refusal
+        if detectSafetyRefusal(predictedAnswer) {
+            // Return random guess but mark as safety refusal
+            let randomIndex = (0..<optionsCount).randomElement() ?? 0
+            let answer = String(Character(UnicodeScalar(65 + randomIndex)!)) // 65 = 'A'
+            return (answer, true, .safetyRefusal)
+        }
+
         let answerRE1 = /answer is \(([A-Ja-j])\)/.ignoresCase()
         let answerRE2 = /answer is:?\s*([A-Ja-j])[\.\s,]/.ignoresCase()
         let answerRE3 = /(?:correct )?answer(?:\sis)?:?\s*([A-Ja-j])[\.\s,\)]/.ignoresCase()
@@ -357,22 +464,22 @@ struct FoundationModelEval {
         let answerRE6 = /answer:\s*([A-Ja-j])/.ignoresCase()
 
         if let result = try? answerRE1.firstMatch(in: predictedAnswer) {
-            return (String(result.1).uppercased(), false)
+            return (String(result.1).uppercased(), false, .validAnswer)
         } else if let result = try? answerRE2.firstMatch(in: predictedAnswer) {
-            return (String(result.1).uppercased(), false)
+            return (String(result.1).uppercased(), false, .validAnswer)
         } else if let result = try? answerRE3.firstMatch(in: predictedAnswer) {
-            return (String(result.1).uppercased(), false)
+            return (String(result.1).uppercased(), false, .validAnswer)
         } else if let result = try? answerRE4.firstMatch(in: predictedAnswer.trimmingCharacters(in: .whitespacesAndNewlines)) {
-            return (String(result.1).uppercased(), false)
+            return (String(result.1).uppercased(), false, .validAnswer)
         } else if let result = try? answerRE5.firstMatch(in: predictedAnswer.trimmingCharacters(in: .whitespacesAndNewlines)) {
-            return (String(result.1).uppercased(), false)
+            return (String(result.1).uppercased(), false, .validAnswer)
         } else if let result = try? answerRE6.firstMatch(in: predictedAnswer) {
-            return (String(result.1).uppercased(), false)
+            return (String(result.1).uppercased(), false, .validAnswer)
         } else {
-            // Random choice - model didn't provide answer in expected format
+            // Format failure - model gave a response but we couldn't parse it
             let randomIndex = (0..<optionsCount).randomElement() ?? 0
             let answer = String(Character(UnicodeScalar(65 + randomIndex)!)) // 65 = 'A'
-            return (answer, true)
+            return (answer, true, .formatFailure)
         }
     }
 
@@ -529,7 +636,7 @@ struct FoundationModelEval {
 
             let dataset = try Dataset.load(from: datasetURL, benchmark: benchmark)
             var answers: [Answer] = []
-            var scores: [String : Score] = Dictionary(uniqueKeysWithValues: zip(dataset.categories, Array(repeating: Score(total: 0, correct: 0), count: dataset.categories.count)))
+            var scores: [String : Score] = Dictionary(uniqueKeysWithValues: zip(dataset.categories, Array(repeating: Score.zero, count: dataset.categories.count)))
             let evalProgressBar = CLIProgressBar(prefix: "Eval")
 
             // Calculate effective total entries (accounting for startQuestion and maxSamples)
@@ -696,15 +803,16 @@ struct FoundationModelEval {
                                 }
                             }
 
-                            // Extract answer using regex patterns
-                            let (extractedChoice, wasRandom) = Self.extractAnswerFromResponse(predictedAnswer, optionsCount: optionsCount)
+                            // Extract answer using regex patterns and classify response
+                            let (extractedChoice, wasRandom, classification) = Self.extractAnswerFromResponse(predictedAnswer, optionsCount: optionsCount)
 
                             let loggedAnswer = Answer(
                                 questionId: questionId,
                                 category: category,
                                 correctChoice: correctChoice,
                                 predictedChoice: extractedChoice,
-                                predictedAnswer: predictedAnswer
+                                predictedAnswer: predictedAnswer,
+                                classification: classification
                             )
 
                             return QuestionResult(
@@ -713,7 +821,8 @@ struct FoundationModelEval {
                                 predictedAnswer: predictedAnswer,
                                 extractedChoice: extractedChoice,
                                 isCorrect: extractedChoice == correctChoice,
-                                wasRandom: wasRandom
+                                wasRandom: wasRandom,
+                                classification: classification
                             )
                         }
                     }
@@ -757,14 +866,19 @@ struct FoundationModelEval {
                     }
 
                     let resultColor = result.isCorrect ? green : red
-                    if result.wasRandom {
-                        print("\(resultColor)Random: \(result.extractedChoice), Correct: \(result.answer.correctChoice) (model format not recognized)\(reset)")
-                    } else {
+                    let yellow = "\u{001B}[33m"
+
+                    switch result.classification {
+                    case .validAnswer:
                         print("\(resultColor)Model: \(result.extractedChoice), Correct: \(result.answer.correctChoice)\(reset)")
+                    case .safetyRefusal:
+                        print("\(yellow)[SAFETY REFUSAL] Random guess: \(result.extractedChoice), Correct: \(result.answer.correctChoice)\(reset)")
+                    case .formatFailure:
+                        print("\(yellow)[FORMAT FAILURE] Random guess: \(result.extractedChoice), Correct: \(result.answer.correctChoice)\(reset)")
                     }
 
                     // Update scores and answers
-                    scores[entry.category] = scores[entry.category]?.updated(with: result.isCorrect)
+                    scores[entry.category] = scores[entry.category]?.updated(with: result.answer)
                     answers.append(result.answer)
                 }
 
@@ -821,16 +935,27 @@ struct FoundationModelEval {
             print("Questions:      \(answers.count) (started at #\(startQuestion))")
             print("Total time:     \(totalTimeString)")
             print(String(repeating: "-", count: 60))
-            print("Accuracy:       \(String(format: "%.2f", answers.macroAccuracy * 100))%")
-            print("Correct:        \(answers.filter { $0.isCorrect }.count) / \(answers.count)")
+
+            // Response Classification Breakdown
+            print("Response Breakdown:")
+            print("  Valid answers:    \(answers.validCount) (\(String(format: "%.1f", answers.formatSuccessRate * 100))%)")
+            print("  Safety refusals:  \(answers.safetyRefusalCount) (\(String(format: "%.1f", answers.safetyRefusalRate * 100))%)")
+            print("  Format failures:  \(answers.formatFailureCount)")
+            print(String(repeating: "-", count: 60))
+
+            // Accuracy Metrics
+            print("Accuracy Metrics:")
+            print("  True Accuracy:    \(String(format: "%.2f", answers.trueAccuracy * 100))% (\(answers.correctValidCount)/\(answers.validCount) valid)")
+            print("  Raw Accuracy:     \(String(format: "%.2f", answers.macroAccuracy * 100))% (\(answers.filter { $0.isCorrect }.count)/\(answers.count) total)")
             print(String(repeating: "=", count: 60))
 
             // Print per-category scores
             if scores.count > 1 {
-                print("\nPer-category scores:")
+                print("\nPer-category scores (true accuracy on valid answers):")
                 for (category, score) in scores.sorted(by: { $0.key < $1.key }) {
-                    let catAcc = score.total > 0 ? Float(score.correct) / Float(score.total) * 100 : 0
-                    print("  \(category): \(String(format: "%.1f", catAcc))% (\(score.correct)/\(score.total))")
+                    let trueAcc = score.validAnswers > 0 ? Float(score.correct) / Float(score.validAnswers) * 100 : 0
+                    let refusalInfo = score.safetyRefusals > 0 ? " [\(score.safetyRefusals) refused]" : ""
+                    print("  \(category): \(String(format: "%.1f", trueAcc))% (\(score.correct)/\(score.validAnswers))\(refusalInfo)")
                 }
             }
 
@@ -869,10 +994,20 @@ struct FoundationModelEval {
                     "few_shot": maxShots,
                     "start_question": startQuestion,
                     "total_questions": answers.count,
-                    "correct": correctCount,
-                    "accuracy": answers.macroAccuracy * 100,
                     "total_time_seconds": totalTime,
-                    "timestamp": timestamp
+                    "timestamp": timestamp,
+                    // Response classification
+                    "valid_answers": answers.validCount,
+                    "safety_refusals": answers.safetyRefusalCount,
+                    "format_failures": answers.formatFailureCount,
+                    // Accuracy metrics
+                    "true_accuracy": answers.trueAccuracy * 100,
+                    "true_correct": answers.correctValidCount,
+                    "raw_accuracy": answers.macroAccuracy * 100,
+                    "raw_correct": correctCount,
+                    // Legacy fields for backwards compatibility
+                    "correct": correctCount,
+                    "accuracy": answers.macroAccuracy * 100
                 ]
                 if let path = adapterPath {
                     summary["adapter"] = path
