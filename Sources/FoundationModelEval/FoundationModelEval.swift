@@ -28,14 +28,27 @@ func formattedOptions(from entry: QuestionEntry) -> String {
     return "**Options**: \(entry.formattedOptions)"
 }
 
+/// Helper to sample entries for few-shot when dev split is missing
+func sampleForFewShot(from entries: [StdMMLUEntry], perSubject: Int) -> [StdMMLUEntry] {
+    var result: [StdMMLUEntry] = []
+    let grouped = entries.groupedBySubject()
+    for (_, subjectEntries) in grouped.sorted(by: { $0.key < $1.key }) {
+        result.append(contentsOf: subjectEntries.prefix(perSubject))
+    }
+    return result
+}
+
 enum DatasetType {
     case mmlu(validation: MMLUDataset, test: MMLUDataset)
+    case stdmmlu(validation: StdMMLUDataset, test: StdMMLUDataset)
     case arc(validation: ARCDataset, test: ARCDataset)
     case boolq(validation: BoolQDataset, test: BoolQDataset)
 
     var categories: [String] {
         switch self {
         case .mmlu(let validation, _):
+            return validation.groupedByCategory().map { $0.key }
+        case .stdmmlu(let validation, _):
             return validation.groupedByCategory().map { $0.key }
         case .arc(_, _):
             return ["arc"]
@@ -48,6 +61,8 @@ enum DatasetType {
         switch self {
         case .mmlu(_, let test):
             return test.count
+        case .stdmmlu(_, let test):
+            return test.count
         case .arc(_, let test):
             return test.count
         case .boolq(_, let test):
@@ -58,6 +73,9 @@ enum DatasetType {
     func getTestEntry(at index: Int) -> QuestionEntry? {
         switch self {
         case .mmlu(_, let test):
+            guard index < test.count else { return nil }
+            return test[index]
+        case .stdmmlu(_, let test):
             guard index < test.count else { return nil }
             return test[index]
         case .arc(_, let test):
@@ -73,6 +91,15 @@ enum DatasetType {
         switch self {
         case .mmlu(let validation, _):
             let intro = MMLUEntry.promptIntro(for: category, reasoning: reasoning)
+            let validationQuestions = validation.groupedByCategory()
+            guard let entries = validationQuestions[category] else { return nil }
+            let examples = entries.prefix(numExamples).map { $0.formatAsExample(reasoning: reasoning) }
+            return "\(intro)\n\n\(examples.joined())"
+
+        case .stdmmlu(let validation, _):
+            // Format subject name for display
+            let formattedCategory = category.replacingOccurrences(of: "_", with: " ")
+            let intro = StdMMLUEntry.promptIntro(for: formattedCategory, reasoning: reasoning)
             let validationQuestions = validation.groupedByCategory()
             guard let entries = validationQuestions[category] else { return nil }
             let examples = entries.prefix(numExamples).map { $0.formatAsExample(reasoning: reasoning) }
@@ -228,7 +255,40 @@ struct Dataset {
             // Use train for few-shot examples, validation as the test set
             return Dataset(type: .boolq(validation: trainSplit, test: validationSplit))
 
-        default: // mmlu
+        case "stdmmlu":
+            // Standard MMLU: load from JSONL files (dev for few-shot, test for evaluation)
+            let devPath = datasetURL.appendingPathComponent("dev.jsonl")
+            let testPath = datasetURL.appendingPathComponent("test.jsonl")
+
+            guard FileManager.default.fileExists(atPath: testPath.path) else {
+                throw NSError(domain: "DatasetError", code: 1, userInfo: [NSLocalizedDescriptionKey: "Could not find Standard MMLU test file at: \(testPath.path)"])
+            }
+
+            print("Found test file at: \(testPath.path)")
+
+            // Load test split (required)
+            let testSplit = try StdMMLUDataset.loadFromFile(at: testPath).validQuestions
+
+            // Load dev split (optional - use test entries for few-shot if missing)
+            var devSplit: StdMMLUDataset
+            if FileManager.default.fileExists(atPath: devPath.path) {
+                print("Found dev file at: \(devPath.path)")
+                devSplit = try StdMMLUDataset.loadFromFile(at: devPath).validQuestions
+                if devSplit.isEmpty {
+                    print("  Dev file empty, using first 5 test entries per subject for few-shot")
+                    devSplit = sampleForFewShot(from: testSplit, perSubject: 5)
+                }
+            } else {
+                print("  Dev file not found, using first 5 test entries per subject for few-shot")
+                devSplit = sampleForFewShot(from: testSplit, perSubject: 5)
+            }
+
+            print("Loaded \(devSplit.count) dev examples and \(testSplit.count) test questions")
+            print("Subjects: \(testSplit.uniqueSubjects.count)")
+
+            return Dataset(type: .stdmmlu(validation: devSplit, test: testSplit))
+
+        default: // mmlu (MMLU-Pro)
             let validationSplit = try MMLUDataset.loadFromFile(at: datasetURL.appending(path: "validation.json")).validQuestions
             let testSplit = try MMLUDataset.loadFromFile(at: datasetURL.appending(path: "test.json")).validQuestions
             return Dataset(type: .mmlu(validation: validationSplit, test: testSplit))
@@ -361,6 +421,24 @@ func detectSafetyRefusal(_ response: String) -> Bool {
     return false
 }
 
+// MARK: - Guardrails Helper
+
+/// Helper to create guardrails with safety filtering disabled via unsafe pointer manipulation
+/// WARNING: This is for research/evaluation purposes only
+enum GuardrailsHelper {
+    static var disabled: SystemLanguageModel.Guardrails {
+        var guardrails = SystemLanguageModel.Guardrails.default
+
+        withUnsafeMutablePointer(to: &guardrails) { ptr in
+            let rawPtr = UnsafeMutableRawPointer(ptr)
+            let boolPtr = rawPtr.assumingMemoryBound(to: Bool.self)
+            boolPtr.pointee = false
+        }
+
+        return guardrails
+    }
+}
+
 // MARK: - Batch Processing Support
 
 /// Result of evaluating a single question (for batch processing)
@@ -372,6 +450,8 @@ struct QuestionResult: Sendable {
     let isCorrect: Bool
     let wasRandom: Bool
     let classification: ResponseClassification
+    let inferenceTime: TimeInterval  // Seconds spent in inference
+    let tokenCount: Int              // Number of tokens in response
 }
 
 /// Thread-safe actor for collecting results from parallel evaluations
@@ -462,6 +542,7 @@ struct FoundationModelEval {
         let answerRE4 = /^([A-Ja-j])(?:[\.\)\s]|$)/.ignoresCase()
         let answerRE5 = /^\(?([A-Ja-j])\)\.?/.ignoresCase()
         let answerRE6 = /answer:\s*([A-Ja-j])/.ignoresCase()
+        let answerRE7 = /\*\*[Aa]nswer\*\*:\s*\(?([A-Ja-j])\)?/  // Markdown bold: **Answer**: X or **Answer**: (X)
 
         if let result = try? answerRE1.firstMatch(in: predictedAnswer) {
             return (String(result.1).uppercased(), false, .validAnswer)
@@ -474,6 +555,8 @@ struct FoundationModelEval {
         } else if let result = try? answerRE5.firstMatch(in: predictedAnswer.trimmingCharacters(in: .whitespacesAndNewlines)) {
             return (String(result.1).uppercased(), false, .validAnswer)
         } else if let result = try? answerRE6.firstMatch(in: predictedAnswer) {
+            return (String(result.1).uppercased(), false, .validAnswer)
+        } else if let result = try? answerRE7.firstMatch(in: predictedAnswer) {
             return (String(result.1).uppercased(), false, .validAnswer)
         } else {
             // Format failure - model gave a response but we couldn't parse it
@@ -491,11 +574,11 @@ struct FoundationModelEval {
         // Example: FoundationModelEval boolq arc-easy 1 5 --max 100  (Multiple benchmarks)
         // Example: FoundationModelEval arc-easy 1 3 --reason  (ARC-Easy with chain-of-thought reasoning)
         // Example: FoundationModelEval mmlu 1 0 --max 50 --adapter /path/to/mmlu_adapter.fmadapter  (With custom adapter)
-        // Supported benchmarks: mmlu, arc-easy, arc-challenge, boolq
+        // Supported benchmarks: mmlu, stdmmlu, arc-easy, arc-challenge, boolq
         // --reason or --think: Enable chain-of-thought prompting (default: direct answer mode)
         // --max N: Maximum number of samples to evaluate (default: all)
         // --adapter PATH: Path to .fmadapter bundle to use for evaluation
-        let validBenchmarks = ["mmlu", "arc-easy", "arc-challenge", "boolq"]
+        let validBenchmarks = ["mmlu", "stdmmlu", "arc-easy", "arc-challenge", "boolq"]
         var benchmarks: [String] = []
         let startQuestion: Int
         let maxShots: Int
@@ -592,6 +675,21 @@ struct FoundationModelEval {
             }
         }
 
+        // Check for --no-guardrails flag (disable safety filtering)
+        let noGuardrails = CommandLine.arguments.contains("--no-guardrails")
+        if noGuardrails {
+            print("⚠️  Guardrails DISABLED (research mode)")
+        }
+
+        // Check for --max-tokens N flag (limit response length)
+        var maxTokens: Int? = nil
+        if let maxTokensIndex = CommandLine.arguments.firstIndex(of: "--max-tokens"),
+           maxTokensIndex + 1 < CommandLine.arguments.count,
+           let maxTokensValue = Int(CommandLine.arguments[maxTokensIndex + 1]) {
+            maxTokens = max(1, min(maxTokensValue, 4096)) // Clamp between 1 and 4096
+            print("Max response tokens: \(maxTokens!)")
+        }
+
         // Store all results for final report
         var allResults: [(benchmark: String, accuracy: Float, correct: Int, total: Int, time: TimeInterval)] = []
 
@@ -610,13 +708,18 @@ struct FoundationModelEval {
                 datasetURL = try await ARCDataset.downloadAndExtract()
             case "boolq":
                 datasetURL = try await BoolQDataset.downloadAndExtract()
-            default: // mmlu
-                print("Downloading MMLU dataset...")
+            case "stdmmlu":
+                datasetURL = try await StdMMLUDataset.downloadAndExtract()
+            case "mmlu":
+                print("Downloading MMLU-Pro dataset...")
                 let repo = Hub.Repo(id: "pcuenq/MMLU-Pro-json", type: .datasets)
                 datasetURL = try await Hub.snapshot(from: repo, matching: "*.json") { @Sendable progress in
                     progressBar.update(progress)
                 }
-                print("MMLU dataset downloaded to: \(datasetURL.path)")
+                print("MMLU-Pro dataset downloaded to: \(datasetURL.path)")
+            default:
+                print("Unknown benchmark: \(benchmark), skipping...")
+                continue
             }
 
             // Shorter prompt to reduce token usage
@@ -741,6 +844,8 @@ struct FoundationModelEval {
                                 finalPrompt = "\(prompt)\n\(arcEntry.formatAsQuestion())\n\(ARCEntry.promptLeadIn(reasoning: useReasoning))"
                             } else if let mmluEntry = entry as? MMLUEntry {
                                 finalPrompt = "\(prompt)\n\(mmluEntry.formatAsQuestion())\n\(MMLUEntry.promptLeadIn(reasoning: useReasoning))"
+                            } else if let stdMmluEntry = entry as? StdMMLUEntry {
+                                finalPrompt = "\(prompt)\n\(stdMmluEntry.formatAsQuestion())\n\(StdMMLUEntry.promptLeadIn(reasoning: useReasoning))"
                             } else {
                                 let leadIn = useReasoning ? "**Answer**: Let's think step by step." : "**Answer**: The answer is ("
                                 finalPrompt = "\(prompt)\n\(formattedQuestion(from: entry))\n\(formattedOptions(from: entry))\n\(leadIn)"
@@ -750,6 +855,8 @@ struct FoundationModelEval {
                     }
                     let correctChoice: String
                     if let mmluEntry = entry as? MMLUEntry, let letter = mmluEntry.answerLetter {
+                        correctChoice = letter
+                    } else if let stdMmluEntry = entry as? StdMMLUEntry, let letter = stdMmluEntry.answerLetter {
                         correctChoice = letter
                     } else if let arcEntry = entry as? ARCEntry, let letter = arcEntry.answerLetter {
                         correctChoice = letter
@@ -765,10 +872,13 @@ struct FoundationModelEval {
                 // Create model outside task group (SystemLanguageModel is Sendable, Adapter is not)
                 let taskModel: SystemLanguageModel
                 if let loadedAdapter = adapter {
-                    taskModel = SystemLanguageModel(adapter: loadedAdapter, guardrails: .default)
+                    let guardrails: SystemLanguageModel.Guardrails = noGuardrails ? GuardrailsHelper.disabled : .default
+                    taskModel = SystemLanguageModel(adapter: loadedAdapter, guardrails: guardrails)
                 } else {
-                    taskModel = SystemLanguageModel(guardrails: .permissiveContentTransformations)
+                    let guardrails: SystemLanguageModel.Guardrails = noGuardrails ? GuardrailsHelper.disabled : .permissiveContentTransformations
+                    taskModel = SystemLanguageModel(guardrails: guardrails)
                 }
+                let taskMaxTokens = maxTokens  // Capture for concurrent access
                 let batchResults = await withTaskGroup(of: QuestionResult?.self, returning: [QuestionResult].self) { group in
                     for item in batchPrompts {
                         let idx = item.idx
@@ -785,15 +895,22 @@ struct FoundationModelEval {
                             // Try with decreasing number of examples if context window is exceeded
                             var predictedAnswer: String = ""
                             var success = false
+                            var tokenCount = 0
+                            let inferenceStart = Date()
 
                             for numExamples in stride(from: maxShots, through: 0, by: -2) {
                                 if success { break }
                                 guard let finalPrompt = prompts[numExamples] else { continue }
 
                                 do {
-                                    let options = GenerationOptions(sampling: .greedy)
+                                    var options = GenerationOptions(sampling: .greedy)
+                                    if let maxTok = taskMaxTokens {
+                                        options.maximumResponseTokens = maxTok
+                                    }
                                     let response = try await session.respond(to: finalPrompt, options: options)
                                     predictedAnswer = response.content
+                                    // Estimate token count (roughly 4 chars per token for English)
+                                    tokenCount = max(1, predictedAnswer.count / 4)
                                     success = true
                                 } catch {
                                     let errorString = String(describing: error)
@@ -802,6 +919,8 @@ struct FoundationModelEval {
                                     }
                                 }
                             }
+
+                            let inferenceTime = Date().timeIntervalSince(inferenceStart)
 
                             // Extract answer using regex patterns and classify response
                             let (extractedChoice, wasRandom, classification) = Self.extractAnswerFromResponse(predictedAnswer, optionsCount: optionsCount)
@@ -822,7 +941,9 @@ struct FoundationModelEval {
                                 extractedChoice: extractedChoice,
                                 isCorrect: extractedChoice == correctChoice,
                                 wasRandom: wasRandom,
-                                classification: classification
+                                classification: classification,
+                                inferenceTime: inferenceTime,
+                                tokenCount: tokenCount
                             )
                         }
                     }
@@ -877,6 +998,11 @@ struct FoundationModelEval {
                         print("\(yellow)[FORMAT FAILURE] Random guess: \(result.extractedChoice), Correct: \(result.answer.correctChoice)\(reset)")
                     }
 
+                    // Show inference stats
+                    let gray = "\u{001B}[90m"
+                    let tps = result.inferenceTime > 0 ? Double(result.tokenCount) / result.inferenceTime : 0
+                    print("\(gray)[Time: \(String(format: "%.2f", result.inferenceTime))s | Tokens: ~\(result.tokenCount) | TPS: \(String(format: "%.1f", tps))]\(reset)")
+
                     // Update scores and answers
                     scores[entry.category] = scores[entry.category]?.updated(with: result.answer)
                     answers.append(result.answer)
@@ -929,8 +1055,12 @@ struct FoundationModelEval {
             print("Benchmark:      \(benchmark)")
             print("Prompt mode:    \(useReasoning ? "reasoning (chain-of-thought)" : "direct answer (no reasoning)")")
             print("Few-shot:       \(maxShots)-shot")
+            print("Guardrails:     \(noGuardrails ? "DISABLED" : "enabled")")
             if let path = adapterPath {
                 print("Adapter:        \(path)")
+            }
+            if let maxTok = maxTokens {
+                print("Max tokens:     \(maxTok)")
             }
             print("Questions:      \(answers.count) (started at #\(startQuestion))")
             print("Total time:     \(totalTimeString)")
@@ -992,6 +1122,7 @@ struct FoundationModelEval {
                     "benchmark": benchmark,
                     "prompt_mode": useReasoning ? "reasoning" : "direct",
                     "few_shot": maxShots,
+                    "guardrails_disabled": noGuardrails,
                     "start_question": startQuestion,
                     "total_questions": answers.count,
                     "total_time_seconds": totalTime,
@@ -1012,6 +1143,9 @@ struct FoundationModelEval {
                 if let path = adapterPath {
                     summary["adapter"] = path
                 }
+                if let maxTok = maxTokens {
+                    summary["max_tokens"] = maxTok
+                }
                 let summaryData = try JSONSerialization.data(withJSONObject: summary, options: [.prettyPrinted, .sortedKeys])
                 let summaryURL = resultsDir.appendingPathComponent("\(filenameBase)_summary.json")
                 try summaryData.write(to: summaryURL)
@@ -1031,11 +1165,15 @@ struct FoundationModelEval {
             print(String(repeating: "═", count: 60))
             print("Prompt mode:    \(useReasoning ? "reasoning (chain-of-thought)" : "direct answer (no reasoning)")")
             print("Few-shot:       \(maxShots)-shot")
+            print("Guardrails:     \(noGuardrails ? "DISABLED" : "enabled")")
             if let path = adapterPath {
                 print("Adapter:        \(path)")
             }
             if let max = maxSamples {
                 print("Max samples:    \(max) per benchmark")
+            }
+            if let maxTok = maxTokens {
+                print("Max tokens:     \(maxTok)")
             }
             print(String(repeating: "-", count: 60))
             // Use string padding instead of %s format (which expects C strings)
@@ -1101,10 +1239,14 @@ struct FoundationModelEval {
                 "total_time_seconds": totalTime,
                 "prompt_mode": useReasoning ? "reasoning" : "direct",
                 "few_shot": maxShots,
+                "guardrails_disabled": noGuardrails,
                 "timestamp": timestamp
             ]
             if let path = adapterPath {
                 combinedReport["adapter"] = path
+            }
+            if let maxTok = maxTokens {
+                combinedReport["max_tokens"] = maxTok
             }
 
             if let combinedData = try? JSONSerialization.data(withJSONObject: combinedReport, options: [.prettyPrinted, .sortedKeys]) {

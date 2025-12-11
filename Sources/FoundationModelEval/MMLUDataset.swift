@@ -126,20 +126,37 @@ extension MMLUEntry {
     /// Introduction text for MMLU prompts - includes category
     static func promptIntro(for category: String, reasoning: Bool) -> String {
         if reasoning {
+            // Reasoning / CoT mode
             return "The following are multiple choice questions (with answers) about \(category). Think step by step and then finish your answer with \"The answer is (X)\" where X is the correct letter choice."
+            //return """
+            //You are answering multiple-choice questions about \(category).
+            //Think step by step and then finish your answer with "The answer is (X)" where X is the correct letter choice.
+            //"""
         } else {
-            return 
-             "You are answering multiple-choice exam questions. Answer each question in the format: \"The answer is (X)\" where X is the correct letter choice."
-            
+            // Direct-answer MCQ mode (no explanations)
+            return """
+            You are answering multiple-choice exam questions.
+
+            IMPORTANT:
+            - Do NOT repeat or restate the question.
+            - Do NOT start your answer with "Question:" or "Options:".
+            - Do NOT list the answer choices again.
+            - Do NOT include any explanation or reasoning.
+            - Answer ONLY in the format: "The answer is (X)" where X is the correct letter choice.
+            """
         }
     }
 
     /// Lead-in text before model generates answer
     static func promptLeadIn(reasoning: Bool) -> String {
         if reasoning {
-            return "**Answer**: Let's think step by step."
+            // CoT mode: explicitly invite step-by-step thinking
+            return "Let's think step by step."
+            //return "Answer: Let's think step by step."
         } else {
-            return "**Answer**: The answer is ("
+            // Direct mode: let the model generate "The answer is (X)" itself
+            // Do NOT pre-seed "Answer: The answer is (" – that conflicts with the system prompt
+            return ""
         }
     }
 
@@ -148,17 +165,17 @@ extension MMLUEntry {
         if reasoning {
             let cot = cotContent.isEmpty ? "The answer is (\(answer))." : cotContent
             return """
-                **Question**: \(question)
-                **Options**: \(formattedOptions)
-                **Answer**: \(cot)
+                Question: \(question)
+                Options: \(formattedOptions)
+                Answer: \(cot)
 
 
                 """
         } else {
             return """
-                **Question**: \(question)
-                **Options**: \(formattedOptions)
-                **Answer**: The answer is (\(answer)).
+                Question: \(question)
+                Options: \(formattedOptions)
+                Answer: The answer is (\(answer)).
 
 
                 """
@@ -167,7 +184,7 @@ extension MMLUEntry {
 
     /// Format this entry as the final question (without answer)
     func formatAsQuestion() -> String {
-        return "**Question**: \(question)\n**Options**: \(formattedOptions)"
+        return "Question: \(question)\nOptions: \(formattedOptions)"
     }
 }
 

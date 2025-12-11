@@ -276,26 +276,33 @@ extension BoolQEntry {
     /// Introduction text for BoolQ prompts - with optional reasoning (chain-of-thought)
     static func promptIntro(reasoning: Bool) -> String {
         if reasoning {
+            // Reasoning / CoT mode
             return """
-                You are answering yes/no questions based on a passage. Read the passage carefully, think step by step about what it says, then answer the question.
-
-                Important: Base your answer ONLY on what the passage says. Think through the relevant information, then finish with "The answer is (A)" for No or "The answer is (B)" for Yes.
-                """
+            You are answering yes/no questions based on a passage.
+            Read the passage carefully, think step by step, then finish with "The answer is (A)" for No or "The answer is (B)" for Yes.
+            """
         } else {
+            // Direct-answer mode (no explanations)
             return """
-                You are answering yes/no questions based on a passage. Read the passage carefully, then answer the question.
+            You are answering yes/no questions based on a passage.
 
-                Important: Base your answer ONLY on what the passage says. Answer with "The answer is (A)" for No or "The answer is (B)" for Yes.
-                """
+            IMPORTANT:
+            - Do NOT repeat or restate the passage or question.
+            - Do NOT provide explanations or reasoning.
+            - Answer ONLY in the format: "The answer is (A)" for No or "The answer is (B)" for Yes.
+            """
         }
     }
 
     /// Lead-in text before model generates answer
     static func promptLeadIn(reasoning: Bool) -> String {
         if reasoning {
-            return "**Answer**: Let's think step by step."
+            // CoT mode: explicitly invite step-by-step thinking
+            return "Let's think step by step."
         } else {
-            return "**Answer**: Based on the passage, the answer is ("
+            // Direct mode: let the model generate the answer itself
+            // Do NOT pre-seed with prefix – that conflicts with the system prompt
+            return ""
         }
     }
 
@@ -305,22 +312,22 @@ extension BoolQEntry {
         let word = answerBool ? "Yes" : "No"
         if reasoning {
             return """
-                **Passage**: \(passage)
+                Passage: \(passage)
 
-                **Question**: \(question)
+                Question: \(question)
 
-                **Answer**: The answer is (\(letter)). \(word)
+                Answer: Let's think step by step. The answer is (\(letter)). \(word)
 
                 ---
 
                 """
         } else {
             return """
-                **Passage**: \(passage)
+                Passage: \(passage)
 
-                **Question**: \(question)
+                Question: \(question)
 
-                **Answer**: Based on the passage, the answer is (\(letter)). \(word)
+                Answer: The answer is (\(letter)).
 
                 ---
 
@@ -330,7 +337,7 @@ extension BoolQEntry {
 
     /// Format this entry as the final question (without answer)
     func formatAsQuestion() -> String {
-        return "**Passage**: \(passage)\n\n**Question**: \(question)"
+        return "Passage: \(passage)\n\nQuestion: \(question)"
     }
 }
 

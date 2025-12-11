@@ -19,18 +19,34 @@ This project enables researchers to:
 
 | Benchmark | Questions | Download | Description |
 |-----------|-----------|----------|-------------|
-| **MMLU** | ~12k | Auto | Massive Multitask Language Understanding (57 subjects) |
+| **StdMMLU** | ~14k | Auto | Standard MMLU (cais/mmlu): 4 options (A-D), 57 subjects - **matches Apple paper** |
+| **MMLU** | ~12k | Auto | MMLU-Pro: harder variant with 10 options (A-J), 14 categories |
 | **ARC-Easy** | ~2.4k | Auto | AI2 Reasoning Challenge (science, easy) |
 | **ARC-Challenge** | ~1.2k | Auto | AI2 Reasoning Challenge (science, hard) |
 | **BoolQ** | ~3.3k | Auto | Boolean Questions (reading comprehension) |
+
+### MMLU vs StdMMLU
+
+**Important**: The [Apple Foundation Models paper](https://arxiv.org/pdf/2507.13575) references **Standard MMLU** (the original Hendrycks benchmark with 4 options A-D). Use `stdmmlu` for comparisons with Apple's published results:
+
+```bash
+# Standard MMLU - matches Apple paper benchmark
+swift run FoundationModelEval stdmmlu
+
+# MMLU-Pro - harder 10-option variant (not the same as Apple paper)
+swift run FoundationModelEval mmlu
+```
 
 ## Usage
 
 ### Basic Usage
 
 ```bash
-# Run MMLU evaluation (default)
-swift run FoundationModelEval
+# Run Standard MMLU evaluation (matches Apple paper benchmark)
+swift run FoundationModelEval stdmmlu
+
+# Run MMLU-Pro evaluation (harder 10-option variant)
+swift run FoundationModelEval mmlu
 
 # Run ARC-Easy evaluation
 swift run FoundationModelEval arc-easy
@@ -39,7 +55,7 @@ swift run FoundationModelEval arc-easy
 swift run FoundationModelEval boolq
 
 # Run multiple benchmarks in sequence
-swift run FoundationModelEval boolq arc-easy arc-challenge 1 5 --max 100
+swift run FoundationModelEval stdmmlu arc-easy arc-challenge boolq 1 5 --max 100
 ```
 
 ### Prompt Modes
@@ -65,7 +81,7 @@ swift run FoundationModelEval arc-easy 1 3 --reason
 FoundationModelEval [benchmarks...] [startQuestion] [maxShots] [options]
 
 Arguments:
-  benchmarks       - One or more: mmlu, arc-easy, arc-challenge, boolq (default: mmlu)
+  benchmarks       - One or more: mmlu, stdmmlu, arc-easy, arc-challenge, boolq (default: mmlu)
   startQuestion    - Question number to start from (default: 1)
   maxShots         - Number of few-shot examples (0-10, default: 5)
 
@@ -76,16 +92,21 @@ Options:
   --batch N          - Process N questions in parallel (1-10, default: 1)
   --save-samples     - Save per-sample detailed results (default: summary only)
   --adapter PATH     - Use a custom LoRA adapter (.fmadapter bundle)
+  --no-guardrails    - Disable safety guardrails (research mode)
+  --max-tokens N     - Limit response length to N tokens (default: unlimited)
 ```
 
 ### Examples
 
 ```bash
-# MMLU: Start from question 1, 5-shot (default, direct answer)
-swift run FoundationModelEval
+# Standard MMLU: 5-shot evaluation (matches Apple paper)
+swift run FoundationModelEval stdmmlu 1 5
 
-# MMLU: Start from question 50, 3-shot, with reasoning
-swift run FoundationModelEval mmlu 50 3 --reason
+# Standard MMLU: with reasoning (chain-of-thought)
+swift run FoundationModelEval stdmmlu 1 5 --reason
+
+# MMLU-Pro: Start from question 50, 3-shot
+swift run FoundationModelEval mmlu 50 3
 
 # ARC-Easy: Start from question 1, 3-shot
 swift run FoundationModelEval arc-easy 1 3
@@ -97,13 +118,13 @@ swift run FoundationModelEval arc-challenge 100 0
 swift run FoundationModelEval boolq 1 5
 
 # Quick test: Run only 100 samples
-swift run FoundationModelEval mmlu 1 5 --max 100
+swift run FoundationModelEval stdmmlu 1 5 --max 100
 
 # Multiple benchmarks: Run BoolQ and ARC-Easy with 100 samples each
 swift run FoundationModelEval boolq arc-easy 1 5 --max 100
 
-# All benchmarks: Run full suite
-swift run FoundationModelEval mmlu arc-easy arc-challenge boolq 1 5 --max 100
+# All benchmarks: Run full suite (Apple paper benchmarks)
+swift run FoundationModelEval stdmmlu arc-easy arc-challenge boolq 1 5 --max 100
 
 # Save per-sample detailed results (in addition to summary)
 swift run FoundationModelEval boolq 1 5 --max 100 --save-samples
@@ -114,8 +135,14 @@ swift run FoundationModelEval arc-easy 1 5 --max 100 --batch 4
 # Evaluate with a custom LoRA adapter
 swift run FoundationModelEval mmlu 1 0 --max 50 --adapter /path/to/my_adapter.fmadapter
 
-# Balanced sampling: 10 questions from each MMLU category (14 categories = 140 total)
-swift run FoundationModelEval mmlu 1 5 --max-per-category 10
+# Balanced sampling: 10 questions from each StdMMLU subject (57 subjects)
+swift run FoundationModelEval stdmmlu 1 5 --max-per-category 10
+
+# Disable guardrails for research evaluation (reduces safety refusals)
+swift run FoundationModelEval arc-easy 1 5 --max 100 --no-guardrails
+
+# Limit response length to 32 tokens (avoid long outputs in direct answer mode)
+swift run FoundationModelEval stdmmlu 1 0 --max 100 --max-tokens 32
 ```
 
 ## Features
@@ -129,7 +156,7 @@ swift run FoundationModelEval mmlu 1 5 --max-per-category 10
 - **Context management** - Automatically reduces examples if context window exceeded
 - **Evaluation summary** - Detailed summary at the end with benchmark settings
 - **Answer extraction** - Robust regex patterns to extract answers in various formats
-- **Permissive guardrails** - Reduces blocking on sensitive content
+- **Guardrails control** - Permissive mode by default, or fully disable with `--no-guardrails`
 
 ## Output
 
@@ -197,21 +224,27 @@ Results on Apple Foundation Models (M5, macOS 26 Tahoe, 5-shot, direct answer mo
 
 | Benchmark | Accuracy | Correct | Time |
 |-----------|----------|---------|------|
+| **StdMMLU** | 60.27% | 8462/14040 | 2h38m |
 | **BoolQ** | 83.55% | 2732/3270 | 38m26s |
 | **ARC-Easy** | 92.09% | 2188/2376 | 13m39s |
 | **ARC-Challenge** | 82.76% | 970/1172 | 8m02s |
+
+**Note**: StdMMLU (Standard MMLU) is the benchmark referenced in the [Apple Foundation Models paper](https://arxiv.org/pdf/2507.13575). The 60.27% result above is comparable to Apple's reported MMLU performance.
 
 ## Custom Adapter Evaluation
 
 Evaluate LoRA fine-tuned adapters against baseline:
 
 ```bash
-# Evaluate adapter on MMLU (0-shot recommended for fine-tuned models)
-swift run FoundationModelEval mmlu 1 0 --max 100 --adapter ./my_adapter.fmadapter
+# Evaluate adapter on Standard MMLU (matches Apple paper)
+swift run FoundationModelEval stdmmlu 1 5 --max 100 --adapter ./my_adapter.fmadapter --no-guardrails
+
+# Evaluate adapter on MMLU-Pro (0-shot recommended for fine-tuned models)
+swift run FoundationModelEval mmlu 1 0 --max 100 --adapter ./my_adapter.fmadapter --no-guardrails
 
 # Compare baseline vs adapter on same benchmark
-swift run FoundationModelEval arc-easy 1 5 --max 100                    # baseline
-swift run FoundationModelEval arc-easy 1 5 --max 100 --adapter ./adapter.fmadapter  # adapter
+swift run FoundationModelEval stdmmlu 1 5 --max 100                                    # baseline
+swift run FoundationModelEval stdmmlu 1 5 --max 100 --adapter ./adapter.fmadapter      # adapter
 ```
 
 Adapters must be in `.fmadapter` bundle format. See [Apple's adapter training documentation](https://developer.apple.com/documentation/foundationmodels/loading-and-using-a-custom-adapter-with-foundation-models) for details.
@@ -219,7 +252,8 @@ Adapters must be in `.fmadapter` bundle format. See [Apple's adapter training do
 ## Dataset Caching
 
 Downloaded datasets are cached locally:
-- MMLU: `~/.cache/huggingface/...`
+- StdMMLU (Standard): `~/.cache/stdmmlu-dataset/` (from `cais/mmlu`)
+- MMLU-Pro: `~/.cache/huggingface/...` (from `pcuenq/MMLU-Pro-json`)
 - ARC: `~/.cache/arc-dataset/`
 - BoolQ: `~/.cache/boolq-dataset/`
 
@@ -239,7 +273,8 @@ Each benchmark has its own dataset file with:
 ```
 Sources/FoundationModelEval/
 ├── FoundationModelEval.swift  # Main evaluation loop
-├── MMLUDataset.swift          # MMLU benchmark
+├── MMLUDataset.swift          # MMLU-Pro benchmark (10 options)
+├── StdMMLUDataset.swift       # Standard MMLU benchmark (4 options)
 ├── ARCDataset.swift           # ARC benchmark
 ├── BoolQDataset.swift         # BoolQ benchmark
 └── CLIProgressBar.swift       # Progress display

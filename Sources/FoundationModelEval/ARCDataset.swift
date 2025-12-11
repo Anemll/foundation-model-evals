@@ -248,18 +248,34 @@ extension ARCEntry {
     /// Introduction text for ARC prompts - with reasoning (chain-of-thought)
     static func promptIntro(reasoning: Bool) -> String {
         if reasoning {
-            return "The following are multiple choice questions (with answers). Think step by step and then finish your answer with \"The answer is (X)\" where X is the correct letter choice."
+            // Reasoning / CoT mode
+            return """
+            You are answering multiple-choice science questions.
+            Think step by step and then finish your answer with "The answer is (X)" where X is the correct letter choice.
+            """
         } else {
-            return "The following are multiple choice questions (with answers). Answer with \"The answer is (X)\" where X is the correct letter choice."
+            // Direct-answer MCQ mode (no explanations)
+            return """
+            You are answering multiple-choice science questions.
+
+            IMPORTANT:
+            - Do NOT repeat or restate the question.
+            - Do NOT list the answer choices again.
+            - Do NOT include any explanation or reasoning.
+            - Answer ONLY in the format: "The answer is (X)" where X is the correct letter choice.
+            """
         }
     }
 
     /// Lead-in text before model generates answer
     static func promptLeadIn(reasoning: Bool) -> String {
         if reasoning {
-            return "**Answer**: Let's think step by step."
+            // CoT mode: explicitly invite step-by-step thinking
+            return "Let's think step by step."
         } else {
-            return "**Answer**: The answer is ("
+            // Direct mode: let the model generate "The answer is (X)" itself
+            // Do NOT pre-seed with prefix – that conflicts with the system prompt
+            return ""
         }
     }
 
@@ -270,17 +286,17 @@ extension ARCEntry {
         let optionText = choices[answerIndex].text
         if reasoning {
             return """
-                **Question**: \(question)
-                **Options**: \(formattedOptions)
-                **Answer**: The answer is (\(letter)). \(optionText)
+                Question: \(question)
+                Options: \(formattedOptions)
+                Answer: The answer is (\(letter)). \(optionText)
 
 
                 """
         } else {
             return """
-                **Question**: \(question)
-                **Options**: \(formattedOptions)
-                **Answer**: The answer is (\(letter)).
+                Question: \(question)
+                Options: \(formattedOptions)
+                Answer: The answer is (\(letter)).
 
 
                 """
@@ -289,7 +305,7 @@ extension ARCEntry {
 
     /// Format this entry as the final question (without answer)
     func formatAsQuestion() -> String {
-        return "**Question**: \(question)\n**Options**: \(formattedOptions)"
+        return "Question: \(question)\nOptions: \(formattedOptions)"
     }
 }
 
